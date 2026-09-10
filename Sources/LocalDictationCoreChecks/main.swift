@@ -16,71 +16,74 @@ let configuration = TranscriptionConfiguration(
 // Synthetic URLs and an injected readability predicate: no files or engines needed.
 let resourceHome = URL(fileURLWithPath: "/Users/resolver-test")
 let bundleResources = URL(fileURLWithPath: "/Fixture.app/Contents/Resources")
-let explicitExecutable = URL(fileURLWithPath: "/chosen/whisper-cli")
-let explicitModel = URL(fileURLWithPath: "/chosen/ggml-base.en.bin")
 let bundledExecutable = bundleResources.appendingPathComponent("whisper-cli")
-let bundledModel = bundleResources.appendingPathComponent("ggml-tiny.en.bin")
-let fallbackExecutable = URL(fileURLWithPath: "/usr/local/bin/whisper-cli")
+let bundledModel = bundleResources.appendingPathComponent(WhisperModelCatalog.defaultModelFilename)
+let homebrewExecutable = URL(fileURLWithPath: "/opt/homebrew/bin/whisper-cli")
+let intelExecutable = URL(fileURLWithPath: "/usr/local/bin/whisper-cli")
 let fallbackModel = WhisperModelCatalog.defaultModelURL(homeDirectory: resourceHome)
-let resourceCases: [(name: String, hasExplicit: Bool, explicitReadable: Bool, bundleReadable: Bool)] = [
-    ("explicit wins", true, true, true),
-    ("unreadable explicit uses bundle", true, false, true),
-    ("absent explicit uses bundle", false, false, true),
-    ("unreadable candidates use fallback", true, false, false),
-    ("absent explicit and unreadable bundle use fallback", false, false, false)
-]
-for executableCase in resourceCases {
-    for modelCase in resourceCases {
-        var readable = Set([fallbackExecutable, fallbackModel])
-        if executableCase.explicitReadable { readable.insert(explicitExecutable) }
-        if executableCase.bundleReadable { readable.insert(bundledExecutable) }
-        if modelCase.explicitReadable { readable.insert(explicitModel) }
-        if modelCase.bundleReadable { readable.insert(bundledModel) }
-        var probes: [URL] = []
-        let resolved = TranscriptionResourceResolver.resolve(
-            explicitExecutableURL: executableCase.hasExplicit ? explicitExecutable : nil,
-            explicitModelURL: modelCase.hasExplicit ? explicitModel : nil,
-            bundledResourceDirectory: bundleResources,
-            homeDirectory: resourceHome,
-            isReadable: { url in
-                probes.append(url)
-                return readable.contains(url)
-            }
-        )
-        let expectedExecutable = executableCase.explicitReadable ? explicitExecutable
-            : executableCase.bundleReadable ? bundledExecutable : fallbackExecutable
-        let expectedModel = modelCase.explicitReadable ? explicitModel
-            : modelCase.bundleReadable ? bundledModel : fallbackModel
-        let scenario = "executable: \(executableCase.name); model: \(modelCase.name)"
-        check(resolved.executableURL == expectedExecutable, "resource precedence (\(scenario))")
-        check(resolved.modelURL == expectedModel, "independent model precedence (\(scenario))")
-        check(resolved.language == "en", "all resolved configurations stay English (\(scenario))")
-        var expectedProbes: [URL] = []
-        if executableCase.hasExplicit { expectedProbes.append(explicitExecutable) }
-        if !executableCase.explicitReadable { expectedProbes.append(bundledExecutable) }
-        if modelCase.hasExplicit { expectedProbes.append(explicitModel) }
-        if !modelCase.explicitReadable { expectedProbes.append(bundledModel) }
-        check(probes == expectedProbes, "readability checks stop at the first match (\(scenario))")
-    }
+
+func resolveWith(readable: Set<URL>, bundled: URL? = bundleResources) -> TranscriptionConfiguration {
+    TranscriptionResourceResolver.resolve(
+        bundledResourceDirectory: bundled,
+        homeDirectory: resourceHome,
+        isReadable: { readable.contains($0) }
+    )
 }
-let missingResources = TranscriptionResourceResolver.resolve(
-    bundledResourceDirectory: nil,
-    homeDirectory: resourceHome,
-    isReadable: { _ in false }
-)
-check(missingResources.executableURL == fallbackExecutable, "missing bundle preserves legacy executable error path")
-check(missingResources.modelURL == fallbackModel, "missing bundle preserves legacy model error path")
-check(bundledModel.lastPathComponent == WhisperModelCatalog.defaultModelFilename, "bundle and fallback share tiny English identity")
-let coreOnlyConfiguration = DictationConfiguration(transcription: missingResources)
-check(!coreOnlyConfiguration.cleanupEnabled && coreOnlyConfiguration.cleanupCommand == nil, "core dictation needs no cleanup engine")
 
 check(
-    WhisperModelCatalog.defaultModelURL(homeDirectory: URL(fileURLWithPath: "/Users/tester")).path
-        == "/Users/tester/.content-agents/whisper/ggml-tiny.en.bin",
-    "Whisper defaults to the tiny English model"
+    resolveWith(readable: [bundledExecutable, homebrewExecutable, intelExecutable]).executableURL
+        == bundledExecutable,
+    "a bundled engine wins over every installed one"
 )
-check(WhisperModelCatalog.isModelFilename("ggml-base.en.bin"), "GGML Whisper models are discoverable")
-check(!WhisperModelCatalog.isModelFilename("ggml-tiny.en.gguf"), "non-GGML Whisper files are excluded")
+// The regression this ordering exists for: a Mac carrying both Homebrew prefixes
+// has the native arm64 build in /opt/homebrew and an x86_64 build in /usr/local
+// that runs about ten times slower under Rosetta.
+check(
+    resolveWith(readable: [homebrewExecutable, intelExecutable]).executableURL == homebrewExecutable,
+    "Apple-silicon Homebrew is preferred over the Intel prefix"
+)
+check(
+    resolveWith(readable: [intelExecutable]).executableURL == intelExecutable,
+    "an Intel-only install still resolves"
+)
+check(
+    resolveWith(readable: [bundledModel, fallbackModel]).modelURL == bundledModel,
+    "a bundled model wins over the downloaded one"
+)
+check(
+    resolveWith(readable: [fallbackModel]).modelURL == fallbackModel,
+    "a downloaded model resolves when nothing is bundled"
+)
+check(resolveWith(readable: []).language == "en", "every resolved configuration stays English")
+
+let missingResources = resolveWith(readable: [], bundled: nil)
+check(
+    missingResources.executableURL == intelExecutable,
+    "missing engine preserves an error path naming a real install location"
+)
+check(missingResources.modelURL == fallbackModel, "missing bundle preserves legacy model error path")
+check(
+    bundledModel.lastPathComponent == WhisperModelCatalog.defaultModelFilename,
+    "bundle and fallback share one model identity"
+)
+_ = DictationConfiguration(transcription: missingResources)
+
+// Shortcut storage: no saved value means the user has never configured one, so
+// the defaults apply. A saved empty list is a real choice and must survive.
+check(Hotkey.decodeBindings(nil) == HotkeyBinding.defaults, "an unset shortcut choice uses the defaults")
+check(Hotkey.decodeBindings(Data("not json".utf8)) == HotkeyBinding.defaults, "unreadable shortcut data falls back to the defaults")
+check(Hotkey.decodeBindings(Hotkey.encodeBindings([])) == [], "a saved empty shortcut list is preserved")
+let savedBindings: [HotkeyBinding] = [
+    .modifierTap(keyCode: 61),
+    .keyCombination(keyCode: 49, modifiers: [.command, .shift], label: "Space"),
+    .mouseButton(buttonNumber: 3),
+]
+check(Hotkey.decodeBindings(Hotkey.encodeBindings(savedBindings)) == savedBindings, "saved shortcuts round-trip")
+check(
+    WhisperModelCatalog.defaultModelURL(homeDirectory: URL(fileURLWithPath: "/Users/tester")).path
+        == "/Users/tester/.content-agents/whisper/ggml-base.en.bin",
+    "Whisper defaults to the base English model"
+)
 check(
     configuration.arguments(for: URL(fileURLWithPath: "/tmp/dictation.wav")) ==
         ["-m", "/tmp/base.en.bin", "-l", "en", "-nt", "-np", "/tmp/dictation.wav"],
@@ -106,6 +109,74 @@ check(
     "inserting keeps the processing indicator"
 )
 check(
+    deliverableTranscript(from: "[BLANK_AUDIO]") == nil,
+    "a blank recording delivers nothing"
+)
+check(
+    deliverableTranscript(from: "  [ Silence ]\n(wind blowing)\n*coughs*  ") == nil,
+    "a recording of only noise delivers nothing"
+)
+check(
+    deliverableTranscript(from: "[BLANK_AUDIO] send the file today [MUSIC]") == "send the file today",
+    "sound labels are removed from around real speech"
+)
+check(
+    deliverableTranscript(from: "call me (555) 123 4567") == "call me (555) 123 4567",
+    "parentheses without a sound word are left alone"
+)
+check(
+    deliverableTranscript(from: "ship it (finally") == "ship it (finally",
+    "an unclosed bracket keeps the rest of the sentence"
+)
+check(
+    deliverableTranscript(from: "  hello   there  ") == "hello there",
+    "spacing is tidied the way it always was"
+)
+check(
+    DictationState.transcribing.canTransition(to: .idle),
+    "a silent recording may end without an insertion"
+)
+
+let historyStart = Date(timeIntervalSince1970: 0)
+var history = TranscriptHistory.appending("first", to: [], date: historyStart)
+history = TranscriptHistory.appending("second", to: history, date: historyStart)
+check(history.map(\.text) == ["second", "first"], "history keeps the newest transcript first")
+check(
+    TranscriptHistory.appending("   ", to: history, date: historyStart).count == 2,
+    "history ignores a blank transcript"
+)
+check(
+    TranscriptHistory.appending("second", to: history, date: historyStart).map(\.text) == ["second", "first"],
+    "history collapses an immediate repeat"
+)
+var capped: [TranscriptHistoryEntry] = []
+for index in 0..<(TranscriptHistory.limit + 5) {
+    capped = TranscriptHistory.appending("entry \(index)", to: capped, date: historyStart)
+}
+check(capped.count == TranscriptHistory.limit, "history stops at the limit")
+check(capped.first?.text == "entry \(TranscriptHistory.limit + 4)", "history drops the oldest entry first")
+check(
+    TranscriptHistoryEntry(text: "one\ntwo\tthree", date: historyStart).menuTitle() == "one two three",
+    "history preview collapses newlines onto one line"
+)
+check(
+    TranscriptHistoryEntry(text: String(repeating: "a", count: 80), date: historyStart)
+        .menuTitle(limit: 10) == String(repeating: "a", count: 10) + "\u{2026}",
+    "history preview truncates a long transcript"
+)
+check(
+    DictationMenuCommand(state: .recording) == DictationMenuCommand(title: "Stop Dictation", isEnabled: true),
+    "recording offers a stop command in the menu"
+)
+check(
+    DictationMenuCommand(state: .idle) == DictationMenuCommand(title: "Start Dictation", isEnabled: true),
+    "idle offers a start command in the menu"
+)
+check(
+    !DictationMenuCommand(state: .transcribing).isEnabled,
+    "transcribing disables the menu command"
+)
+check(
     DictationIndicatorLayout.size(for: .idle) == DictationIndicatorSize(width: 32, height: 32),
     "idle indicator stays compact"
 )
@@ -125,36 +196,52 @@ check(
     compactFrame == DictationIndicatorFrame(originX: 1874, originY: 632, width: 32, height: 32),
     "persisted indicator frames preserve the top edge while normalizing to compact size"
 )
+// Matching: a modifier tap fires on the press with no other modifier held, a key
+// combination needs exactly its own modifiers, and only listed shortcuts count.
+let rightOption: [HotkeyBinding] = [.modifierTap(keyCode: 61)]
 check(
-    Hotkey.matchesRightOptionPress(
-        keyCode: 61,
-        optionIsDown: true,
-        controlIsDown: false,
-        commandIsDown: false
-    ),
+    Hotkey.matchesToggle(.flagsChanged(keyCode: 61, modifiers: .option), bindings: rightOption),
     "right Option matches"
 )
 check(
-    !Hotkey.matchesRightOptionPress(
-        keyCode: 58,
-        optionIsDown: true,
-        controlIsDown: false,
-        commandIsDown: false
-    ),
+    !Hotkey.matchesToggle(.flagsChanged(keyCode: 58, modifiers: .option), bindings: rightOption),
     "left Option does not match"
 )
-check(Hotkey.matchesMiddleMouseButton(buttonNumber: 2), "middle mouse button matches")
-check(!Hotkey.matchesMiddleMouseButton(buttonNumber: 0), "left mouse button does not match")
 check(
-    Hotkey.matchesToggle(.flagsChanged(
-        keyCode: 61,
-        optionIsDown: true,
-        controlIsDown: false,
-        commandIsDown: false
-    )),
-    "global right Option event matches"
+    !Hotkey.matchesToggle(.flagsChanged(keyCode: 61, modifiers: []), bindings: rightOption),
+    "releasing right Option does not match"
 )
-check(Hotkey.matchesToggle(.otherMouseDown(buttonNumber: 2)), "global middle mouse event matches")
+check(
+    !Hotkey.matchesToggle(.flagsChanged(keyCode: 61, modifiers: [.option, .command]), bindings: rightOption),
+    "right Option held with Command does not match"
+)
+
+let commandShiftSpace: [HotkeyBinding] = [
+    .keyCombination(keyCode: 49, modifiers: [.command, .shift], label: "Space"),
+]
+check(
+    Hotkey.matchesToggle(.keyDown(keyCode: 49, modifiers: [.command, .shift], isRepeat: false), bindings: commandShiftSpace),
+    "a saved key combination matches"
+)
+check(
+    !Hotkey.matchesToggle(.keyDown(keyCode: 49, modifiers: [.command, .shift], isRepeat: true), bindings: commandShiftSpace),
+    "a key repeat does not match"
+)
+check(
+    !Hotkey.matchesToggle(.keyDown(keyCode: 49, modifiers: [.command, .shift, .control], isRepeat: false), bindings: commandShiftSpace),
+    "an extra modifier does not match"
+)
+check(commandShiftSpace[0].systemHotKey?.keyCode == 49, "a key combination can be registered as a system hot key")
+check(HotkeyBinding.modifierTap(keyCode: 61).systemHotKey == nil, "a modifier tap cannot be a system hot key")
+check(HotkeyBinding.modifierTap(keyCode: 61).displayName == "Right Option", "a modifier tap prints its key name")
+check(commandShiftSpace[0].displayName == "\u{21E7}\u{2318}Space", "a key combination prints its modifier symbols")
+
+let middleMouse: [HotkeyBinding] = [.mouseButton(buttonNumber: 2)]
+check(Hotkey.matchesToggle(.otherMouseDown(buttonNumber: 2), bindings: middleMouse), "middle mouse button matches")
+check(!Hotkey.matchesToggle(.otherMouseDown(buttonNumber: 3), bindings: middleMouse), "a different mouse button does not match")
+check(!Hotkey.matchesToggle(.otherMouseDown(buttonNumber: 2), bindings: rightOption), "an unlisted shortcut is ignored")
+check(!Hotkey.matchesToggle(.otherMouseDown(buttonNumber: 2), bindings: []), "no shortcuts means nothing matches")
+
 let delivery = TranscriptDelivery(text: "hello world")
 check(delivery.keepsTranscriptOnClipboard, "transcripts remain on the clipboard")
 check(delivery.automaticallyPastes, "transcripts are automatically pasted")

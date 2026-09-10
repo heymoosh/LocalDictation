@@ -10,7 +10,7 @@ Usage: bash scripts/build-app.sh
 
 Without arguments, assemble the existing native .build/release/LocalDictation
 for local development (make app). Universal mode builds both app architectures,
-bundles arm64/whisper-cli, x86_64/whisper-cli, ggml-tiny.en.bin from DIR,
+bundles arm64/whisper-cli, x86_64/whisper-cli, ggml-base.en.bin from DIR,
 and signs the runtime before the app. Use release.sh to verify pinned inputs.
 Universal output must not exist; output and scratch must be outside the repo.
 USAGE
@@ -28,7 +28,16 @@ if [[ $# == 0 ]]; then
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
   cp "$ROOT_DIR/.build/release/LocalDictation" "$app/Contents/MacOS/LocalDictation"
   cp "$ROOT_DIR/Info.plist" "$app/Contents/Info.plist"
-  codesign --force --sign - --identifier local.muxin.LocalDictation "$app"
+  # An ad-hoc signature is identified by a hash of the binary, so macOS drops every
+  # granted permission on each rebuild. Sign with the development certificate when
+  # it exists; see scripts/create-signing-identity.sh.
+  identity="${LOCALDICTATION_SIGN_IDENTITY:-Local Dictation Dev}"
+  if ! security find-identity -v -p codesigning | grep -q "\"$identity\""; then
+    identity=-
+    echo 'Warning: signing ad-hoc; macOS will forget this app'\''s permissions on the next rebuild.' >&2
+    echo '         Run: bash scripts/create-signing-identity.sh' >&2
+  fi
+  codesign --force --sign "$identity" --identifier local.muxin.LocalDictation "$app"
   codesign --verify --strict "$app"
   # Preserve an existing development bundle until the fresh one has verified.
   if [[ -e "$ROOT_DIR/LocalDictation.app" || -L "$ROOT_DIR/LocalDictation.app" ]]; then
@@ -58,7 +67,7 @@ release_external_path "$output"
 [[ "$output" == *.app && ! -e "$output" && ! -L "$output" ]] || release_fail 'Output must be a new .app path.'
 release_archs "$inputs/arm64/whisper-cli" arm64
 release_archs "$inputs/x86_64/whisper-cli" x86_64
-[[ -s "$inputs/ggml-tiny.en.bin" && -f "$inputs/ggml-tiny.en.bin" ]] || release_fail 'Missing English model.'
+[[ -s "$inputs/ggml-base.en.bin" && -f "$inputs/ggml-base.en.bin" ]] || release_fail 'Missing English model.'
 mkdir -p "$scratch"
 work="$(mktemp -d "$scratch/build-app.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
@@ -78,7 +87,7 @@ lipo -create "$work/LocalDictation-arm64" "$work/LocalDictation-x86_64" \
 lipo -create "$inputs/arm64/whisper-cli" "$inputs/x86_64/whisper-cli" \
   -output "$app/Contents/Resources/whisper-cli"
 chmod 755 "$app/Contents/MacOS/LocalDictation" "$app/Contents/Resources/whisper-cli"
-cp "$inputs/ggml-tiny.en.bin" "$app/Contents/Resources/ggml-tiny.en.bin"
+cp "$inputs/ggml-base.en.bin" "$app/Contents/Resources/ggml-base.en.bin"
 cp "$ROOT_DIR/THIRD-PARTY-NOTICES.md" "$app/Contents/Resources/THIRD-PARTY-NOTICES.md"
 cp "$ROOT_DIR/Info.plist" "$app/Contents/Info.plist"
 release_system_dependencies "$app/Contents/MacOS/LocalDictation"

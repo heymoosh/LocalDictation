@@ -19,10 +19,10 @@ final class ClipboardTextInserter {
         }
         guard delivery.automaticallyPastes else { return true }
 
-        let accessibilityOptions = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
-        let pasteAccess = PasteAutomationAccess(
-            accessibilityTrusted: AXIsProcessTrustedWithOptions(accessibilityOptions)
-        )
+        // Checked without the prompt option on purpose: a system modal in the middle
+        // of a paste interrupts whatever the user is dictating into. The transcript
+        // still reaches the clipboard, and Settings reports the live status.
+        let pasteAccess = PasteAutomationAccess(accessibilityTrusted: AXIsProcessTrusted())
         guard pasteAccess.canPaste else {
             NSLog("Accessibility permission is unavailable; transcript copied to clipboard.")
             return false

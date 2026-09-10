@@ -78,7 +78,7 @@ for key in ('CFBundleIdentifier', 'CFBundleExecutable', 'CFBundlePackageType',
             'CFBundleShortVersionString', 'CFBundleVersion', 'LSMinimumSystemVersion'):
     if info.get(key) != expected.get(key):
         sys.exit('Bundle metadata mismatch: ' + key)
-model = app / 'Contents/Resources/ggml-tiny.en.bin'
+model = app / 'Contents/Resources/ggml-base.en.bin'
 if not model.is_file() or model.stat().st_size == 0:
     sys.exit('Missing/empty English model')
 notices = app / 'Contents/Resources/THIRD-PARTY-NOTICES.md'
@@ -204,12 +204,12 @@ release_fixture_app() (
     printf '%s\n' 'int main(void) { return 0; }' | \
       xcrun clang -x c - -arch "$arch" -mmacosx-version-min=14.0 -o "$work/inputs/$arch/whisper-cli"
   done
-  printf '%s\n' 'SYNTHETIC PACKAGING FIXTURE; NOT A WHISPER MODEL' > "$work/inputs/ggml-tiny.en.bin"
+  printf '%s\n' 'SYNTHETIC PACKAGING FIXTURE; NOT A WHISPER MODEL' > "$work/inputs/ggml-base.en.bin"
   app="$work/artifacts/LocalDictation.app"
   lipo -create "$work/inputs/arm64/whisper-cli" "$work/inputs/x86_64/whisper-cli" \
     -output "$app/Contents/MacOS/LocalDictation"
   cp "$app/Contents/MacOS/LocalDictation" "$app/Contents/Resources/whisper-cli"
-  cp "$work/inputs/ggml-tiny.en.bin" "$app/Contents/Resources/ggml-tiny.en.bin"
+  cp "$work/inputs/ggml-base.en.bin" "$app/Contents/Resources/ggml-base.en.bin"
   cp "$RELEASE_ROOT/Info.plist" "$app/Contents/Info.plist"
   cp "$RELEASE_ROOT/THIRD-PARTY-NOTICES.md" "$app/Contents/Resources/THIRD-PARTY-NOTICES.md"
   codesign --force --sign - "$app/Contents/Resources/whisper-cli"
@@ -268,7 +268,7 @@ release_smoke_self_test() (
   dependencies="$(otool -L "$work/non-system-dependency")"
   [[ "$dependencies" == *'@rpath/libpackaging-fixture.dylib'* ]] || release_fail 'Synthetic dylib dependency was not planted.'
   release_expect_failure 'runtime with non-system @rpath dylib' release_system_dependencies "$work/non-system-dependency"
-  rm "$work/artifacts/LocalDictation.app/Contents/Resources/ggml-tiny.en.bin"
+  rm "$work/artifacts/LocalDictation.app/Contents/Resources/ggml-base.en.bin"
   release_expect_failure 'missing bundled model' release_validate_app "$work/artifacts/LocalDictation.app"
   echo 'PASS smoke self-test; fixture files removed on exit'
 )

@@ -13,17 +13,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let inputDeviceManager = AudioInputDeviceManager()
     private var microphoneMenu: NSMenu!
     private var microphoneMenuItem: NSMenuItem!
-    private var whisperModelMenu: NSMenu!
-    private var whisperModelMenuItem: NSMenuItem!
-    private var pastePermissionMenuItem: NSMenuItem!
-    private var hotkeyPermissionMenuItem: NSMenuItem!
-    private var launchAtLoginMenuItem: NSMenuItem!
-    private var testPasteMenuItem: NSMenuItem!
+    private var dictationMenuItem: NSMenuItem!
+    private var historyMenu: NSMenu!
+    private var historyMenuItem: NSMenuItem!
+    private let historyStore = TranscriptHistoryStore()
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
     private var globalEventMonitor: Any?
-    private var carbonHotKey: EventHotKeyRef?
+    private var carbonHotKeys: [EventHotKeyRef] = []
     private var carbonHandler: EventHandlerRef?
+    private var settingsWindow: SettingsWindow?
+    private let historyDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter
+    }()
+    private var aboutWindow: AboutWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -32,43 +38,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.imagePosition = .imageLeading
 
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Start Dictation", action: #selector(toggleDictation), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Toggle Local Cleanup", action: #selector(toggleCleanup), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Choose Whisper Executable…", action: #selector(chooseWhisperExecutable), keyEquivalent: ""))
-        whisperModelMenu = NSMenu()
-        whisperModelMenu.delegate = self
-        whisperModelMenuItem = NSMenuItem(title: "Select Whisper Model", action: nil, keyEquivalent: "")
-        whisperModelMenuItem.submenu = whisperModelMenu
-        menu.addItem(whisperModelMenuItem)
-        menu.addItem(NSMenuItem(title: "Use Automatic Whisper Resources", action: #selector(useAutomaticWhisperResources), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Choose Cleanup Executable…", action: #selector(chooseCleanupExecutable), keyEquivalent: ""))
+        // The dictation command's title and enablement are set from state in
+        // menuWillOpen, so AppKit's own validation would only fight it.
+        menu.autoenablesItems = false
+        menu.delegate = self
+        dictationMenuItem = NSMenuItem(title: "Start Dictation", action: #selector(toggleDictation), keyEquivalent: "")
+        menu.addItem(dictationMenuItem)
+        menu.addItem(.separator())
         microphoneMenu = NSMenu()
         microphoneMenu.delegate = self
         microphoneMenuItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
         microphoneMenuItem.submenu = microphoneMenu
         menu.addItem(microphoneMenuItem)
-        pastePermissionMenuItem = NSMenuItem(title: "Paste automation: Checking…", action: nil, keyEquivalent: "")
-        pastePermissionMenuItem.isEnabled = false
-        menu.addItem(pastePermissionMenuItem)
-        hotkeyPermissionMenuItem = NSMenuItem(title: "Hotkeys: Checking…", action: nil, keyEquivalent: "")
-        hotkeyPermissionMenuItem.isEnabled = false
-        menu.addItem(hotkeyPermissionMenuItem)
-        launchAtLoginMenuItem = NSMenuItem(
-            title: "Launch at Login",
-            action: #selector(toggleLaunchAtLogin),
-            keyEquivalent: ""
-        )
-        menu.addItem(launchAtLoginMenuItem)
-        testPasteMenuItem = NSMenuItem(
-            title: "Test Paste into Frontmost App",
-            action: #selector(testPaste),
-            keyEquivalent: ""
-        )
-        menu.addItem(testPasteMenuItem)
+        historyMenu = NSMenu()
+        historyMenu.delegate = self
+        historyMenuItem = NSMenuItem(title: "Recent Transcripts", action: nil, keyEquivalent: "")
+        historyMenuItem.submenu = historyMenu
+        menu.addItem(historyMenuItem)
+        menu.addItem(NSMenuItem(title: "Settings…", action: #selector(showSettingsWindow), keyEquivalent: ","))
+        menu.addItem(NSMenuItem(title: "About Local Dictation", action: #selector(showAboutWindow), keyEquivalent: ""))
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Open Microphone Settings", action: #selector(openMicrophoneSettings), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Open Accessibility Settings", action: #selector(openAccessibilitySettings), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Open Input Monitoring Settings", action: #selector(openInputMonitoringSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit Local Dictation", action: #selector(quit), keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
         statusItem.menu = menu
@@ -77,30 +66,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller = DictationController(
             statusItem: statusItem,
             indicatorWindow: indicatorWindow,
-            inputDeviceManager: inputDeviceManager
+            inputDeviceManager: inputDeviceManager,
+            historyStore: historyStore
         )
+        settingsWindow = SettingsWindow(onBindingsChanged: { [weak self] in self?.reinstallHotkeys() })
+        aboutWindow = AboutWindow()
+
         refreshMicrophoneMenu()
-        refreshWhisperModelMenu()
-        refreshPastePermissionStatus()
-        refreshHotkeyPermissionStatus()
-        refreshLaunchAtLoginStatus()
         requestMicrophonePermission()
         requestInputMonitoringPermission()
-        installCarbonFallbackHotkey()
-        installGlobalHotkey()
+        requestAccessibilityPermission()
+        installHotkeys()
+        warmUpTranscriptionEngine()
+
+        if !UserDefaults.standard.bool(forKey: SettingsWindow.hasShownDefaultsKey) {
+            UserDefaults.standard.set(true, forKey: SettingsWindow.hasShownDefaultsKey)
+            settingsWindow?.show()
+        }
+    }
+
+    /// The first Whisper run after an engine or OS update spends ~17s compiling
+    /// Metal shaders before it transcribes anything. Paying that once at launch,
+    /// on a fraction of a second of silence, keeps it out of the first dictation.
+    private func warmUpTranscriptionEngine() {
+        DispatchQueue.global(qos: .utility).async {
+            let configuration = LocalCommandTranscriber.defaultConfiguration()
+            guard let silence = try? LocalCommandTranscriber.writeSilentWarmUpAudio() else { return }
+            defer { try? FileManager.default.removeItem(at: silence) }
+            _ = try? LocalCommandTranscriber().transcribe(audioURL: silence, configuration: configuration)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        uninstallHotkeys()
+    }
+
+    /// Installs whatever the user's shortcuts need. The event tap is the main
+    /// route; Carbon only fills in for key combinations when the tap could not be
+    /// created, because it is the one route that works without Input Monitoring.
+    private func installHotkeys() {
+        let bindings = SettingsWindow.bindings
+        if !bindings.isEmpty {
+            installGlobalHotkey()
+            if eventTap == nil, globalEventMonitor == nil {
+                installCarbonHotKeys(for: bindings)
+            } else {
+                // The tap came up on a later attempt, so drop the fallback rather
+                // than let a key combination fire twice.
+                uninstallCarbonHotKeys()
+            }
+        }
+        refreshStatusItemAppearance()
+    }
+
+    private func uninstallHotkeys() {
         if let eventTap, let eventTapSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapSource, .commonModes)
             CFMachPortInvalidate(eventTap)
         }
+        eventTap = nil
+        eventTapSource = nil
+        if let globalEventMonitor { NSEvent.removeMonitor(globalEventMonitor) }
         globalEventMonitor = nil
-        if let carbonHotKey { UnregisterEventHotKey(carbonHotKey) }
-        if let carbonHandler { RemoveEventHandler(carbonHandler) }
+        uninstallCarbonHotKeys()
     }
 
-    private func installCarbonFallbackHotkey() {
+    private func uninstallCarbonHotKeys() {
+        carbonHotKeys.forEach { UnregisterEventHotKey($0) }
+        carbonHotKeys = []
+        if let carbonHandler { RemoveEventHandler(carbonHandler) }
+        carbonHandler = nil
+    }
+
+    /// Called when Settings changes the user's shortcuts.
+    func reinstallHotkeys() {
+        uninstallHotkeys()
+        installHotkeys()
+    }
+
+    private func refreshStatusItemAppearance() {
+        // With no shortcuts saved there is nothing to listen for, so that is not a
+        // warning state — the menu still starts dictation.
+        let listening = SettingsWindow.bindings.isEmpty
+            || eventTap != nil
+            || globalEventMonitor != nil
+            || !carbonHotKeys.isEmpty
+        statusItem.button?.title = listening ? "LD" : "LD!"
+        controller?.refreshMicrophoneStatus()
+    }
+
+    private func installCarbonHotKeys(for bindings: [HotkeyBinding]) {
+        let combinations = bindings.compactMap(\.systemHotKey)
+        guard carbonHotKeys.isEmpty, carbonHandler == nil, !combinations.isEmpty else { return }
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
@@ -116,30 +173,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         guard handlerStatus == noErr else {
             NSLog("Local Dictation: Carbon hotkey handler registration failed: %d", handlerStatus)
-            statusItem.button?.title = "LD!"
-            statusItem.button?.toolTip = "Local Dictation — could not register ⌘⇧Space"
             return
         }
 
-        let hotKeyID = EventHotKeyID(signature: 0x4C444943, id: 1)
-        let hotKeyStatus = RegisterEventHotKey(
-            UInt32(kVK_Space),
-            UInt32(cmdKey | shiftKey),
-            hotKeyID,
-            GetApplicationEventTarget(),
-            0,
-            &carbonHotKey
-        )
-        if hotKeyStatus != noErr {
-            NSLog("Local Dictation: Carbon hotkey registration failed: %d", hotKeyStatus)
-            statusItem.button?.title = "LD!"
-            statusItem.button?.toolTip = "Local Dictation — could not register ⌘⇧Space"
-        } else {
-            NSLog("Local Dictation: Carbon hotkey ⌘⇧Space registered")
+        for (index, combination) in combinations.enumerated() {
+            var reference: EventHotKeyRef?
+            let status = RegisterEventHotKey(
+                UInt32(combination.keyCode),
+                carbonModifiers(combination.modifiers),
+                EventHotKeyID(signature: 0x4C444943, id: UInt32(index + 1)),
+                GetApplicationEventTarget(),
+                0,
+                &reference
+            )
+            if status == noErr, let reference {
+                carbonHotKeys.append(reference)
+            } else {
+                NSLog("Local Dictation: Carbon hotkey registration failed: %d", status)
+            }
         }
     }
 
+    private func carbonModifiers(_ modifiers: HotkeyModifiers) -> UInt32 {
+        var value: UInt32 = 0
+        if modifiers.contains(.control) { value |= UInt32(controlKey) }
+        if modifiers.contains(.option) { value |= UInt32(optionKey) }
+        if modifiers.contains(.shift) { value |= UInt32(shiftKey) }
+        if modifiers.contains(.command) { value |= UInt32(cmdKey) }
+        return value
+    }
+
     private func installGlobalHotkey() {
+        guard eventTap == nil, globalEventMonitor == nil else { return }
         let mask = CGEventMask(
             (1 << CGEventType.flagsChanged.rawValue)
                 | (1 << CGEventType.keyDown.rawValue)
@@ -157,18 +222,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         guard let eventTap else {
             installGlobalEventMonitor()
-            if globalEventMonitor != nil {
-                statusItem.button?.title = "LD"
-                statusItem.button?.toolTip = "Local Dictation — right Option and middle mouse ready"
-                return
-            }
-            if carbonHotKey == nil {
-                statusItem.button?.title = "LD!"
-                statusItem.button?.toolTip = "Local Dictation — enable Accessibility and Input Monitoring access"
-            } else {
-                statusItem.button?.title = "LD"
-                statusItem.button?.toolTip = "Local Dictation — right Option and middle mouse ready"
-            }
             return
         }
         globalEventMonitor = nil
@@ -190,7 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
             guard let self,
                   let hotkeyEvent = hotkeyEvent(from: event),
-                  Hotkey.matchesToggle(hotkeyEvent) else {
+                  Hotkey.matchesToggle(hotkeyEvent, bindings: SettingsWindow.bindings) else {
                 return
             }
             NSLog("Local Dictation: global monitor hotkey event received")
@@ -219,91 +272,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func toggleCleanup() {
-        controller.toggleCleanup()
-    }
-
-    @objc private func chooseWhisperExecutable() {
-        chooseFile(defaultKey: "transcriptionExecutable", message: "Choose the local whisper-cli executable")
-    }
-
-    @objc private func chooseWhisperModel(_ sender: NSMenuItem) {
-        guard let path = sender.representedObject as? String else { return }
-        UserDefaults.standard.set(path, forKey: "transcriptionModel")
-        refreshWhisperModelMenu()
-    }
-
-    @objc private func chooseOtherWhisperModel() {
-        chooseFile(defaultKey: "transcriptionModel", message: "Choose a local Whisper model for English transcription")
-        refreshWhisperModelMenu()
-    }
-
-    @objc private func useAutomaticWhisperResources() {
-        UserDefaults.standard.removeObject(forKey: "transcriptionExecutable")
-        UserDefaults.standard.removeObject(forKey: "transcriptionModel")
-        refreshWhisperModelMenu()
-    }
-
-    @objc private func chooseCleanupExecutable() {
-        chooseFile(defaultKey: "cleanupExecutable", message: "Choose a local cleanup executable")
-    }
-
     func menuWillOpen(_ menu: NSMenu) {
         if menu === microphoneMenu { refreshMicrophoneMenu() }
-        if menu === whisperModelMenu { refreshWhisperModelMenu() }
+        if menu === historyMenu { refreshHistoryMenu() }
+        // Input Monitoring can be granted after launch, so retry a tap that never
+        // came up rather than making the user relaunch. Re-registering is safe:
+        // both installers no-op when they already hold something.
         if menu === statusItem.menu {
-            if eventTap == nil && globalEventMonitor == nil {
-                installGlobalHotkey()
+            refreshDictationMenuItem()
+            if eventTap == nil, globalEventMonitor == nil {
+                installHotkeys()
             }
-            refreshPastePermissionStatus()
-            refreshHotkeyPermissionStatus()
-            refreshLaunchAtLoginStatus()
         }
     }
 
-    @objc private func toggleLaunchAtLogin() {
-        do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
-            }
-            refreshLaunchAtLoginStatus()
-        } catch {
-            refreshLaunchAtLoginStatus()
-            let alert = NSAlert()
-            alert.messageText = "Launch at Login Could Not Be Changed"
-            alert.informativeText = error.localizedDescription
-            alert.runModal()
-        }
+    private func refreshDictationMenuItem() {
+        let command = DictationMenuCommand(state: controller.currentState)
+        dictationMenuItem.title = command.title
+        dictationMenuItem.isEnabled = command.isEnabled
     }
 
-    private func refreshLaunchAtLoginStatus() {
-        guard launchAtLoginMenuItem != nil else { return }
-        let status: LaunchAtLoginStatus
-        switch SMAppService.mainApp.status {
-        case .enabled:
-            status = .enabled
-        case .notRegistered:
-            status = .disabled
-        case .requiresApproval:
-            status = .requiresApproval
-        case .notFound:
-            status = .unavailable
-        @unknown default:
-            status = .unavailable
+    /// Copies the chosen transcript so the user can paste it wherever they meant
+    /// it to go. Pasting for them is deliberately not done here: the menu click
+    /// already moved focus to this app, so there is no reliable target field.
+    @objc private func copyHistoryEntry(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    @objc private func clearHistory() {
+        historyStore.clear()
+        refreshHistoryMenu()
+    }
+
+    private func refreshHistoryMenu() {
+        historyMenu.removeAllItems()
+        let entries = historyStore.recent
+        guard !entries.isEmpty else {
+            let empty = NSMenuItem(title: "No transcripts yet", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            historyMenu.addItem(empty)
+            return
         }
-        launchAtLoginMenuItem.state = status.isEnabled ? .on : .off
-        switch status {
-        case .enabled:
-            launchAtLoginMenuItem.toolTip = "Local Dictation will open automatically when you log in."
-        case .disabled:
-            launchAtLoginMenuItem.toolTip = "Open Local Dictation automatically when you log in."
-        case .requiresApproval:
-            launchAtLoginMenuItem.toolTip = "Approve Local Dictation in System Settings to enable launch at login."
-        case .unavailable:
-            launchAtLoginMenuItem.toolTip = "Launch at login is unavailable for this app build."
+        for entry in entries {
+            let item = NSMenuItem(title: entry.menuTitle(), action: #selector(copyHistoryEntry), keyEquivalent: "")
+            item.target = self
+            item.representedObject = entry.text
+            // The row is one truncated line, so the hover text carries the rest
+            // along with when it was dictated.
+            item.toolTip = "\(historyDateFormatter.string(from: entry.date))\n\n\(entry.text)"
+            historyMenu.addItem(item)
         }
+        historyMenu.addItem(.separator())
+        let clear = NSMenuItem(title: "Clear History", action: #selector(clearHistory), keyEquivalent: "")
+        clear.target = self
+        historyMenu.addItem(clear)
     }
 
     @objc private func chooseMicrophone(_ sender: NSMenuItem) {
@@ -355,90 +380,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller?.refreshMicrophoneStatus()
     }
 
-    private func refreshWhisperModelMenu() {
-        guard whisperModelMenu != nil else { return }
-        whisperModelMenu.removeAllItems()
-
-        let currentModelURL = LocalCommandTranscriber.defaultConfiguration().modelURL
-        let modelDirectory = WhisperModelCatalog.defaultModelURL(
-            homeDirectory: FileManager.default.homeDirectoryForCurrentUser
-        ).deletingLastPathComponent()
-        var modelURLs = (try? FileManager.default.contentsOfDirectory(
-            at: modelDirectory,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ))?.filter { url in
-            WhisperModelCatalog.isModelFilename(url.lastPathComponent)
-                && (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
-                && FileManager.default.isReadableFile(atPath: url.path)
-        } ?? []
-
-        if FileManager.default.isReadableFile(atPath: currentModelURL.path),
-           !modelURLs.contains(currentModelURL) {
-            modelURLs.append(currentModelURL)
-        }
-        modelURLs.sort { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-
-        for modelURL in modelURLs {
-            let item = NSMenuItem(
-                title: WhisperModelCatalog.displayName(for: modelURL.lastPathComponent),
-                action: #selector(chooseWhisperModel(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = modelURL.path
-            item.state = modelURL.path == currentModelURL.path ? .on : .off
-            whisperModelMenu.addItem(item)
-        }
-
-        if modelURLs.isEmpty {
-            let unavailable = NSMenuItem(title: "No installed Whisper models", action: nil, keyEquivalent: "")
-            unavailable.isEnabled = false
-            whisperModelMenu.addItem(unavailable)
-        }
-
-        whisperModelMenu.addItem(.separator())
-        let chooseOther = NSMenuItem(
-            title: "Choose Other Whisper Model…",
-            action: #selector(chooseOtherWhisperModel),
-            keyEquivalent: ""
-        )
-        chooseOther.target = self
-        whisperModelMenu.addItem(chooseOther)
-
-        if FileManager.default.isReadableFile(atPath: currentModelURL.path) {
-            whisperModelMenuItem.title = "Select Whisper Model: \(WhisperModelCatalog.displayName(for: currentModelURL.lastPathComponent))"
-        } else {
-            whisperModelMenuItem.title = "Select Whisper Model: Missing"
-        }
-    }
-
-    private func refreshPastePermissionStatus() {
-        guard pastePermissionMenuItem != nil else { return }
-        let pasteAccess = PasteAutomationAccess(accessibilityTrusted: AXIsProcessTrusted())
-        if pasteAccess.canPaste {
-            pastePermissionMenuItem.title = "Paste automation: Ready"
-            pastePermissionMenuItem.toolTip = "Accessibility access is available."
-        } else {
-            pastePermissionMenuItem.title = "Paste automation: Enable Accessibility"
-            pastePermissionMenuItem.toolTip = "Enable LocalDictation under Privacy & Security → Accessibility."
-        }
-    }
-
-    private func refreshHotkeyPermissionStatus() {
-        guard hotkeyPermissionMenuItem != nil else { return }
-        if eventTap != nil || globalEventMonitor != nil {
-            hotkeyPermissionMenuItem.title = "Hotkeys: Ready"
-            hotkeyPermissionMenuItem.toolTip = "Physical right Option and middle mouse button toggle dictation."
-        } else if CGPreflightListenEventAccess() {
-            hotkeyPermissionMenuItem.title = "Hotkeys: Relaunch LocalDictation"
-            hotkeyPermissionMenuItem.toolTip = "Input Monitoring is allowed; relaunch LocalDictation to register the event tap."
-        } else {
-            hotkeyPermissionMenuItem.title = "Hotkeys: Enable Input Monitoring"
-            hotkeyPermissionMenuItem.toolTip = "Enable LocalDictation under Privacy & Security → Input Monitoring, then relaunch it."
-        }
-    }
-
     private func requestMicrophonePermission() {
         guard AVAudioApplication.shared.recordPermission == .undetermined else { return }
         AVAudioApplication.requestRecordPermission { granted in
@@ -451,24 +392,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = CGRequestListenEventAccess()
     }
 
-    @objc private func testPaste() {
-        let currentProcessID = NSRunningApplication.current.processIdentifier
-        let targetProcessID: pid_t?
-        if let frontmostApplication = NSWorkspace.shared.frontmostApplication,
-           frontmostApplication.processIdentifier != currentProcessID {
-            targetProcessID = frontmostApplication.processIdentifier
-        } else {
-            targetProcessID = nil
-        }
-        guard ClipboardTextInserter().insert("LocalDictation paste test", into: targetProcessID) else {
-            refreshPastePermissionStatus()
-            let alert = NSAlert()
-            alert.messageText = "Paste automation is not ready"
-            alert.informativeText = "The test text was left on the clipboard. Check the Paste automation status and enable the listed macOS permissions."
-            alert.runModal()
-            return
-        }
-        refreshPastePermissionStatus()
+    /// Unlike Microphone and Input Monitoring above, Accessibility only shows its
+    /// system alert when this call is made with the prompt option — otherwise it
+    /// stays silent until something else (like a paste attempt) happens to trigger it.
+    private func requestAccessibilityPermission() {
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
     }
 
     private func microphoneMenuTitle(for info: InputDeviceInfo) -> String {
@@ -477,26 +406,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return info.name
     }
 
-    private func chooseFile(defaultKey: String, message: String) {
-        let panel = NSOpenPanel()
-        panel.message = message
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        if panel.runModal() == .OK, let url = panel.url {
-            UserDefaults.standard.set(url.path, forKey: defaultKey)
-        }
+    @objc private func showSettingsWindow() {
+        settingsWindow?.show()
     }
 
-    @objc private func openMicrophoneSettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
-    }
-
-    @objc private func openAccessibilitySettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-    }
-
-    @objc private func openInputMonitoringSettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!)
+    @objc private func showAboutWindow() {
+        aboutWindow?.show()
     }
 
     @objc private func quit() {
@@ -521,7 +436,7 @@ private func carbonHotKeyHandler(
         nil,
         &hotKeyID
     )
-    guard status == noErr, hotKeyID.signature == 0x4C444943, hotKeyID.id == 1 else { return noErr }
+    guard status == noErr, hotKeyID.signature == 0x4C444943 else { return noErr }
     NSLog("Local Dictation: Carbon hotkey event received")
     let app = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
     Task { @MainActor in app.triggerFromGlobalHotkey() }
@@ -542,7 +457,7 @@ private func globalHotkeyCallback(
 
     guard let userInfo,
           let hotkeyEvent = hotkeyEvent(from: type, event: event),
-          Hotkey.matchesToggle(hotkeyEvent) else {
+          Hotkey.matchesToggle(hotkeyEvent, bindings: SettingsWindow.bindings) else {
         return Unmanaged.passUnretained(event)
     }
 
@@ -556,20 +471,17 @@ private func globalHotkeyCallback(
 }
 
 private func hotkeyEvent(from type: CGEventType, event: CGEvent) -> Hotkey.Event? {
-    let flags = event.flags
+    let modifiers = hotkeyModifiers(from: event.flags)
     switch type {
     case .flagsChanged:
         return .flagsChanged(
             keyCode: UInt16(event.getIntegerValueField(.keyboardEventKeycode)),
-            optionIsDown: flags.contains(.maskAlternate),
-            controlIsDown: flags.contains(.maskControl),
-            commandIsDown: flags.contains(.maskCommand)
+            modifiers: modifiers
         )
     case .keyDown:
         return .keyDown(
             keyCode: UInt16(event.getIntegerValueField(.keyboardEventKeycode)),
-            controlIsDown: flags.contains(.maskControl),
-            optionIsDown: flags.contains(.maskAlternate),
+            modifiers: modifiers,
             isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0
         )
     case .otherMouseDown:
@@ -579,23 +491,22 @@ private func hotkeyEvent(from type: CGEventType, event: CGEvent) -> Hotkey.Event
     }
 }
 
+private func hotkeyModifiers(from flags: CGEventFlags) -> HotkeyModifiers {
+    var modifiers: HotkeyModifiers = []
+    if flags.contains(.maskControl) { modifiers.insert(.control) }
+    if flags.contains(.maskAlternate) { modifiers.insert(.option) }
+    if flags.contains(.maskShift) { modifiers.insert(.shift) }
+    if flags.contains(.maskCommand) { modifiers.insert(.command) }
+    return modifiers
+}
+
 private func hotkeyEvent(from event: NSEvent) -> Hotkey.Event? {
-    let flags = event.modifierFlags
+    let modifiers = HotkeyRecorderButton.modifiers(from: event.modifierFlags)
     switch event.type {
     case .flagsChanged:
-        return .flagsChanged(
-            keyCode: event.keyCode,
-            optionIsDown: flags.contains(.option),
-            controlIsDown: flags.contains(.control),
-            commandIsDown: flags.contains(.command)
-        )
+        return .flagsChanged(keyCode: event.keyCode, modifiers: modifiers)
     case .keyDown:
-        return .keyDown(
-            keyCode: event.keyCode,
-            controlIsDown: flags.contains(.control),
-            optionIsDown: flags.contains(.option),
-            isRepeat: event.isARepeat
-        )
+        return .keyDown(keyCode: event.keyCode, modifiers: modifiers, isRepeat: event.isARepeat)
     case .otherMouseDown:
         return .otherMouseDown(buttonNumber: Int64(event.buttonNumber))
     default:
@@ -608,19 +519,24 @@ private final class DictationController {
     private let statusItem: NSStatusItem
     private let indicatorWindow: StatusIndicatorWindow
     private let inputDeviceManager: AudioInputDeviceManager
+    private let historyStore: TranscriptHistoryStore
     private let recorder: AudioRecorder
     private let inserter = ClipboardTextInserter()
     private var state: DictationState = .idle
     private var targetProcessID: pid_t?
 
+    var currentState: DictationState { state }
+
     init(
         statusItem: NSStatusItem,
         indicatorWindow: StatusIndicatorWindow,
-        inputDeviceManager: AudioInputDeviceManager
+        inputDeviceManager: AudioInputDeviceManager,
+        historyStore: TranscriptHistoryStore
     ) {
         self.statusItem = statusItem
         self.indicatorWindow = indicatorWindow
         self.inputDeviceManager = inputDeviceManager
+        self.historyStore = historyStore
         self.recorder = AudioRecorder(inputDeviceManager: inputDeviceManager)
         indicatorWindow.update(for: state)
         refreshMicrophoneStatus()
@@ -674,13 +590,12 @@ private final class DictationController {
                 defer { try? FileManager.default.removeItem(at: audioURL) }
                 do {
                     let configuration = LocalCommandTranscriber.defaultConfiguration()
-                    var text = try LocalCommandTranscriber().transcribe(audioURL: audioURL, configuration: configuration)
-                    if UserDefaults.standard.bool(forKey: "cleanupEnabled") {
-                        text = (try? LocalCommandCleaner().clean(text)) ?? text
+                    let text = try LocalCommandTranscriber().transcribe(audioURL: audioURL, configuration: configuration)
+                    guard let spoken = deliverableTranscript(from: text) else {
+                        DispatchQueue.main.async { self?.finishWithoutSpeech() }
+                        return
                     }
-                    let normalized = normalizeTranscript(text)
-                    guard !normalized.isEmpty else { throw DictationError.emptyTranscript }
-                    DispatchQueue.main.async { self?.complete(normalized) }
+                    DispatchQueue.main.async { self?.complete(spoken) }
                 } catch {
                     let message = error.localizedDescription
                     DispatchQueue.main.async { self?.fail(message) }
@@ -695,6 +610,9 @@ private final class DictationController {
         state = .inserting
         indicatorWindow.update(for: state)
         let delivery = TranscriptDelivery(text: text)
+        // Saved before the paste is attempted: a paste that silently fails is
+        // precisely when the user needs to find this transcript again.
+        historyStore.record(delivery.text)
         let inserted = inserter.insert(delivery.text, into: targetProcessID)
         targetProcessID = nil
         if !inserted {
@@ -705,6 +623,20 @@ private final class DictationController {
         statusItem.button?.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "Local Dictation")
         statusItem.button?.title = "LD"
         refreshMicrophoneStatus()
+    }
+
+    /// Silence and background noise end the same way an insertion does, minus
+    /// the insertion: nothing is pasted, nothing is saved to history, and no
+    /// alert interrupts the user. Holding the hotkey by accident should cost
+    /// them a click, not a dialog.
+    private func finishWithoutSpeech() {
+        targetProcessID = nil
+        state = .idle
+        indicatorWindow.update(for: state)
+        statusItem.button?.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "Local Dictation")
+        statusItem.button?.title = "LD"
+        refreshMicrophoneStatus()
+        NSLog("Local Dictation: no speech was detected; nothing was inserted.")
     }
 
     private func frontmostTargetProcessID() -> pid_t? {
@@ -726,12 +658,6 @@ private final class DictationController {
         showStatus("Dictation failed: \(message)")
     }
 
-    func toggleCleanup() {
-        let enabled = !UserDefaults.standard.bool(forKey: "cleanupEnabled")
-        UserDefaults.standard.set(enabled, forKey: "cleanupEnabled")
-        showStatus(enabled ? "Local cleanup enabled." : "Local cleanup disabled.")
-    }
-
     private func showStatus(_ message: String) {
         NSLog("Local Dictation: %@", message)
         let alert = NSAlert()
@@ -739,9 +665,4 @@ private final class DictationController {
         alert.informativeText = message
         alert.runModal()
     }
-}
-
-private enum DictationError: LocalizedError {
-    case emptyTranscript
-    var errorDescription: String? { "No speech was detected." }
 }

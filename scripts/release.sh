@@ -6,7 +6,7 @@ release_verify_inputs() {
   python3 - "$1" "$2" <<'PY'
 import hashlib, pathlib, re, sys
 directory, manifest = map(pathlib.Path, sys.argv[1:])
-expected = {'arm64/whisper-cli', 'x86_64/whisper-cli', 'ggml-tiny.en.bin'}
+expected = {'arm64/whisper-cli', 'x86_64/whisper-cli', 'ggml-base.en.bin'}
 if not directory.is_dir() or directory.is_symlink():
     sys.exit('Input directory is missing or a symlink')
 if not manifest.is_file() or manifest.is_symlink():
@@ -66,8 +66,8 @@ release_self_test() (
   mkdir -p "$work/inputs/arm64" "$work/inputs/x86_64"
   printf 'synthetic arm64\n' > "$work/inputs/arm64/whisper-cli"
   printf 'synthetic x86_64\n' > "$work/inputs/x86_64/whisper-cli"
-  printf 'synthetic model\n' > "$work/inputs/ggml-tiny.en.bin"
-  (cd "$work/inputs"; shasum -a 256 arm64/whisper-cli x86_64/whisper-cli ggml-tiny.en.bin) > "$work/pinned.sha256"
+  printf 'synthetic model\n' > "$work/inputs/ggml-base.en.bin"
+  (cd "$work/inputs"; shasum -a 256 arm64/whisper-cli x86_64/whisper-cli ggml-base.en.bin) > "$work/pinned.sha256"
   release_verify_inputs "$work/inputs" "$work/pinned.sha256"
   release_expect_failure 'unknown argument' bash "$RELEASE_ROOT/scripts/release.sh" --unknown
   release_expect_failure 'missing argument' bash "$RELEASE_ROOT/scripts/release.sh" --inputs
@@ -81,9 +81,9 @@ release_self_test() (
   printf 'extra\n' > "$work/inputs/extra"
   release_expect_failure 'extra input' release_verify_inputs "$work/inputs" "$work/pinned.sha256"
   rm "$work/inputs/extra"
-  mv "$work/inputs/ggml-tiny.en.bin" "$work/model"
+  mv "$work/inputs/ggml-base.en.bin" "$work/model"
   release_expect_failure 'missing input' release_verify_inputs "$work/inputs" "$work/pinned.sha256"
-  mv "$work/model" "$work/inputs/ggml-tiny.en.bin"
+  mv "$work/model" "$work/inputs/ggml-base.en.bin"
   cp "$work/pinned.sha256" "$work/bad.sha256"
   head -n 1 "$work/pinned.sha256" >> "$work/bad.sha256"
   release_expect_failure 'extra manifest entry' release_verify_inputs "$work/inputs" "$work/bad.sha256"
@@ -103,7 +103,7 @@ Usage: bash scripts/release.sh --inputs DIR --manifest FILE --scratch DIR --outp
        bash scripts/release.sh --self-test
 
 Local-only macOS 14+ universal release, ad-hoc signed (not Developer ID/notarized).
-DIR must contain exactly: arm64/whisper-cli, x86_64/whisper-cli, ggml-tiny.en.bin.
+DIR must contain exactly: arm64/whisper-cli, x86_64/whisper-cli, ggml-base.en.bin.
 FILE must contain exactly three lines: 64 hex SHA-256 digits, TWO spaces, then
 one of those relative filenames. Keep the manifest separate from the input DIR.
 Use independently trusted, pinned hashes. Runtimes must statically include
@@ -162,7 +162,7 @@ PY
   mkdir "$work/artifacts"
   bash "$RELEASE_ROOT/scripts/build-app.sh" --universal --inputs "$work/inputs" \
     --scratch "$work/build" --output "$work/artifacts/LocalDictation.app"
-  cmp "$work/inputs/ggml-tiny.en.bin" "$work/artifacts/LocalDictation.app/Contents/Resources/ggml-tiny.en.bin"
+  cmp "$work/inputs/ggml-base.en.bin" "$work/artifacts/LocalDictation.app/Contents/Resources/ggml-base.en.bin"
   release_package_artifacts "$work/artifacts" "$work"
   release_validate_artifacts "$work/artifacts"
   mkdir -p "$(dirname "$output")"

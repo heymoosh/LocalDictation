@@ -3,18 +3,10 @@ import LocalDictationCore
 
 final class LocalCommandTranscriber {
     static func defaultConfiguration(
-        defaults: UserDefaults = .standard,
         bundle: Bundle = .main,
         fileManager: FileManager = .default
     ) -> TranscriptionConfiguration {
-        func explicitURL(forKey key: String) -> URL? {
-            guard let path = defaults.string(forKey: key), !path.isEmpty else { return nil }
-            return URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
-        }
-
-        return TranscriptionResourceResolver.resolve(
-            explicitExecutableURL: explicitURL(forKey: "transcriptionExecutable"),
-            explicitModelURL: explicitURL(forKey: "transcriptionModel"),
+        TranscriptionResourceResolver.resolve(
             bundledResourceDirectory: bundle.resourceURL,
             homeDirectory: fileManager.homeDirectoryForCurrentUser,
             isReadable: { url in
@@ -24,6 +16,28 @@ final class LocalCommandTranscriber {
                     && fileManager.isReadableFile(atPath: url.path)
             }
         )
+    }
+
+    /// A fifth of a second of 16 kHz mono silence, written by hand so the warm-up
+    /// run needs no audio engine and no bundled fixture.
+    static func writeSilentWarmUpAudio() throws -> URL {
+        let sampleRate: UInt32 = 16_000
+        let sampleCount = Int(sampleRate) / 5
+        let dataBytes = UInt32(sampleCount * 2)
+        var wav = Data()
+        func append(_ text: String) { wav.append(contentsOf: Array(text.utf8)) }
+        func append32(_ value: UInt32) { withUnsafeBytes(of: value.littleEndian) { wav.append(contentsOf: $0) } }
+        func append16(_ value: UInt16) { withUnsafeBytes(of: value.littleEndian) { wav.append(contentsOf: $0) } }
+        append("RIFF"); append32(36 + dataBytes); append("WAVE")
+        append("fmt "); append32(16); append16(1); append16(1)
+        append32(sampleRate); append32(sampleRate * 2); append16(2); append16(16)
+        append("data"); append32(dataBytes)
+        wav.append(Data(count: sampleCount * 2))
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-dictation-warmup-\(UUID().uuidString).wav")
+        try wav.write(to: url)
+        return url
     }
 
     func transcribe(audioURL: URL, configuration: TranscriptionConfiguration) throws -> String {
