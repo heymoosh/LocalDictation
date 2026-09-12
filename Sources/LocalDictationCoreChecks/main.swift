@@ -86,7 +86,7 @@ check(
 )
 check(
     configuration.arguments(for: URL(fileURLWithPath: "/tmp/dictation.wav")) ==
-        ["-m", "/tmp/base.en.bin", "-l", "en", "-nt", "-np", "/tmp/dictation.wav"],
+        ["-m", "/tmp/base.en.bin", "-l", "en", "-bs", "1", "-bo", "1", "-nt", "-np", "/tmp/dictation.wav"],
     "Whisper arguments use the configured model, language, and WAV"
 )
 check(normalizeTranscript("  hello\nworld  ") == "hello world", "transcripts normalize whitespace")
@@ -96,6 +96,7 @@ check(DictationState.recording.canTransition(to: .transcribing), "recording tran
 check(DictationState.transcribing.canTransition(to: .inserting), "transcribing transitions to inserting")
 check(DictationState.inserting.canTransition(to: .idle), "inserting transitions to idle")
 check(!DictationState.idle.canTransition(to: .inserting), "idle cannot skip to inserting")
+check(DictationState.recording.canTransition(to: .idle), "a recording can be cancelled straight to idle")
 check(
     DictationIndicatorPresentation(state: .recording).kind == .recording,
     "recording shows the recording indicator"

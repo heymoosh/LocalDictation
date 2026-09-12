@@ -55,6 +55,9 @@ final class LocalCommandTranscriber {
         process.arguments = configuration.arguments(for: audioURL)
         process.standardOutput = standardOutput
         process.standardError = standardError
+        // The user is waiting on this result, so it should not queue behind
+        // background work (builds, VMs) when the Mac is busy.
+        process.qualityOfService = .userInteractive
         try process.run()
         process.waitUntilExit()
         let outputData = standardOutput.fileHandleForReading.readDataToEndOfFile()

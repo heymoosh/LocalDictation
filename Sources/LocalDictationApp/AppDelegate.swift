@@ -22,6 +22,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var globalEventMonitor: Any?
     private var carbonHotKeys: [EventHotKeyRef] = []
     private var carbonHandler: EventHandlerRef?
+    /// The saved shortcuts, read once per install instead of decoded from
+    /// UserDefaults on every key press the event tap sees.
+    private(set) var hotkeyBindings: [HotkeyBinding] = []
     private var settingsWindow: SettingsWindow?
     private let historyDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -106,6 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// created, because it is the one route that works without Input Monitoring.
     private func installHotkeys() {
         let bindings = SettingsWindow.bindings
+        hotkeyBindings = bindings
         if !bindings.isEmpty {
             installGlobalHotkey()
             if eventTap == nil, globalEventMonitor == nil {
@@ -241,9 +245,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let mask: NSEvent.EventTypeMask = [.flagsChanged, .keyDown, .otherMouseDown]
         globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
-            guard let self,
-                  let hotkeyEvent = hotkeyEvent(from: event),
-                  Hotkey.matchesToggle(hotkeyEvent, bindings: SettingsWindow.bindings) else {
+            guard let self else { return }
+            // A monitor cannot consume the event the way the event tap can, but
+            // cancelling here still stops the recording before it is missed.
+            if event.type == .keyDown, event.keyCode == escapeKeyCode {
+                Task { @MainActor in self.cancelRecordingIfActive() }
+                return
+            }
+            guard let hotkeyEvent = hotkeyEvent(from: event),
+                  Hotkey.matchesToggle(hotkeyEvent, bindings: MainActor.assumeIsolated { self.hotkeyBindings }) else {
                 return
             }
             NSLog("Local Dictation: global monitor hotkey event received")
@@ -262,6 +272,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func triggerFromGlobalHotkey() {
         toggleDictation()
+    }
+
+    /// Escape cancels a recording in progress. Returns whether it actually did
+    /// so, so callers only swallow the key when there was something to cancel.
+    @discardableResult
+    func cancelRecordingIfActive() -> Bool {
+        controller.cancelIfRecording()
     }
 
     func reenableEventTap() {
@@ -443,6 +460,9 @@ private func carbonHotKeyHandler(
     return noErr
 }
 
+/// Escape's key code, shared by the event tap and its NSEvent-monitor fallback.
+private let escapeKeyCode: Int64 = 0x35
+
 private func globalHotkeyCallback(
     _ proxy: CGEventTapProxy,
     _ type: CGEventType,
@@ -455,13 +475,22 @@ private func globalHotkeyCallback(
         Task { @MainActor in app.reenableEventTap() }
     }
 
-    guard let userInfo,
-          let hotkeyEvent = hotkeyEvent(from: type, event: event),
-          Hotkey.matchesToggle(hotkeyEvent, bindings: SettingsWindow.bindings) else {
+    guard let userInfo else { return Unmanaged.passUnretained(event) }
+    let app = Unmanaged<AppDelegate>.fromOpaque(userInfo).takeUnretainedValue()
+
+    // The tap runs on the main run loop, so it is safe to check recording
+    // state synchronously here rather than hopping through a Task — the
+    // return value has to decide whether to swallow Escape immediately.
+    if type == .keyDown, event.getIntegerValueField(.keyboardEventKeycode) == escapeKeyCode {
+        let cancelled = MainActor.assumeIsolated { app.cancelRecordingIfActive() }
+        return cancelled ? nil : Unmanaged.passUnretained(event)
+    }
+
+    guard let hotkeyEvent = hotkeyEvent(from: type, event: event),
+          Hotkey.matchesToggle(hotkeyEvent, bindings: MainActor.assumeIsolated { app.hotkeyBindings }) else {
         return Unmanaged.passUnretained(event)
     }
 
-    let app = Unmanaged<AppDelegate>.fromOpaque(userInfo).takeUnretainedValue()
     NSLog("Local Dictation: global event tap hotkey event received")
     Task { @MainActor in app.triggerFromGlobalHotkey() }
     if case .otherMouseDown = hotkeyEvent {
@@ -574,6 +603,27 @@ private final class DictationController {
             state = .failed
             showStatus("Microphone unavailable: \(error.localizedDescription)")
         }
+    }
+
+    /// Discards a recording in progress rather than transcribing it. Returns
+    /// whether there was actually a recording to cancel.
+    @discardableResult
+    func cancelIfRecording() -> Bool {
+        guard state == .recording else { return false }
+        targetProcessID = nil
+        do {
+            let audioURL = try recorder.stop()
+            try? FileManager.default.removeItem(at: audioURL)
+        } catch {
+            NSLog("Local Dictation: cancel failed to stop the recorder: %@", error.localizedDescription)
+        }
+        state = .idle
+        indicatorWindow.update(for: state)
+        statusItem.button?.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "Local Dictation")
+        statusItem.button?.title = "LD"
+        refreshMicrophoneStatus()
+        NSLog("Local Dictation: recording cancelled with Escape.")
+        return true
     }
 
     private func stop() {

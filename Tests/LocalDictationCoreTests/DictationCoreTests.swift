@@ -91,7 +91,7 @@ final class DictationCoreTests: XCTestCase {
 
         XCTAssertEqual(
             config.arguments(for: audioURL),
-            ["-m", "/tmp/base.en.bin", "-l", "en", "-nt", "-np", "/tmp/dictation.wav"]
+            ["-m", "/tmp/base.en.bin", "-l", "en", "-bs", "1", "-bo", "1", "-nt", "-np", "/tmp/dictation.wav"]
         )
     }
 
@@ -105,6 +105,7 @@ final class DictationCoreTests: XCTestCase {
         XCTAssertTrue(DictationState.recording.canTransition(to: .transcribing))
         XCTAssertTrue(DictationState.transcribing.canTransition(to: .inserting))
         XCTAssertTrue(DictationState.inserting.canTransition(to: .idle))
+        XCTAssertTrue(DictationState.recording.canTransition(to: .idle))
         XCTAssertFalse(DictationState.idle.canTransition(to: .inserting))
     }
 

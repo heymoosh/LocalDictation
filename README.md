@@ -57,6 +57,8 @@ manual paste; it does not open a transcript window.
   Out of the box that is right `Option` or the middle mouse button. The first menu
   item follows the same state, reading **Start Dictation** when idle and **Stop
   Dictation** while recording, so the menu alone is enough to run a dictation.
+- Press `Escape` while recording to cancel: the audio is discarded and nothing is
+  transcribed or pasted. Escape is only intercepted while a recording is active.
 - Set your own under **Settings… → What starts dictation**. **Add Shortcut…**
   records whatever you press next: a modifier key on its own (tap and release), a
   key combination (hold modifiers, then press the key), or an extra mouse button.
